@@ -1,8 +1,11 @@
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+import os
+import csv
 import math
 import random
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Dict
 
 
 # ============================================================
@@ -42,7 +45,7 @@ class VM:
 
 
 # ============================================================
-# BASELINE MMA SCHEDULER
+# BASELINE MMA
 # ============================================================
 
 class MMAScheduler:
@@ -65,22 +68,22 @@ class MMAScheduler:
     def _passes_security_and_reliability(task: Task, vm: VM):
         return vm.security_level >= task.security_req and vm.reliability >= task.reliability_req
 
-    def _feature_match_prob(self, task_val, vm_val):
-        if vm_val <= 0:
+    def _feature_match_prob(self, t_val, v_val):
+        if v_val <= 0:
             return 0
-        if task_val > vm_val:
+        if t_val > v_val:
             return 0
-        return 1 / (1 + abs(task_val - vm_val) / vm_val)
+        return 1 / (1 + abs(t_val - v_val) / v_val)
 
-    def _matching_degree(self, task: Task, vm: VM):
+    def _matching_degree(self, task, vm):
         t, v = task.resource_vector(), vm.resource_vector()
-        p = [self._feature_match_prob(t[i], v[i]) for i in range(4)]
-        prod = 1
-        for x in p:
-            prod *= x
-        return prod
+        probs = [self._feature_match_prob(t[i], v[i]) for i in range(4)]
+        result = 1
+        for p in probs:
+            result *= p
+        return result
 
-    def matching_phase(self, tasks: List[Task], vms: List[VM]):
+    def matching_phase(self, tasks, vms):
         vm_index = {vm.id: vm for vm in vms}
 
         candidate_set = {
@@ -90,110 +93,104 @@ class MMAScheduler:
         }
 
         ordered_tasks = sorted(
-            tasks, key=lambda t: (t.priority, t.workload_mi))
-        vm_loads = {vm.id: 0 for vm in vms}
-        first_allocate = {}
+            tasks, key=lambda x: (x.priority, x.workload_mi))
+        vm_load = {vm.id: 0 for vm in vms}
+        first_alloc = {}
 
-        for task in ordered_tasks:
-            candidates = candidate_set[task.id]
-
-            if not candidates:
+        for t in ordered_tasks:
+            cands = candidate_set[t.id]
+            if not cands:
                 best_vm = max(vms, key=lambda x: x.security_level)
-                first_allocate[task.id] = best_vm.id
-                vm_loads[best_vm.id] += self.ect(task, best_vm)
+                first_alloc[t.id] = best_vm.id
+                vm_load[best_vm.id] += self.ect(t, best_vm)
                 continue
 
             best_vm, best_md = None, -1
-            for vm_id in candidates:
-                vm = vm_index[vm_id]
-                md = self._matching_degree(task, vm)
+            for vid in cands:
+                md = self._matching_degree(t, vm_index[vid])
                 if md > best_md:
-                    best_vm, best_md = vm_id, md
+                    best_md = md
+                    best_vm = vid
 
-            first_allocate[task.id] = best_vm
-            vm_loads[best_vm] += self.ect(task, vm_index[best_vm])
+            first_alloc[t.id] = best_vm
+            vm_load[best_vm] += self.ect(t, vm_index[best_vm])
 
-        return candidate_set, first_allocate
+        return candidate_set, first_alloc
 
-    def compute_stats(self, tasks, vms, allocation):
+    def compute_stats(self, tasks, vms, alloc):
         vm_index = {vm.id: vm for vm in vms}
         vm_ect = {vm.id: 0 for vm in vms}
         vm_ecc = {vm.id: 0 for vm in vms}
 
         for t in tasks:
-            vm_id = allocation[t.id]
-            vm = vm_index[vm_id]
-            ect = self.ect(t, vm)
-            vm_ect[vm_id] += ect
-            vm_ecc[vm_id] += ect * vm.cost_per_time
-
-        makespan = max(vm_ect.values())
-        total_cost = sum(vm_ecc.values())
-
-        avg_ect = sum(vm_ect.values()) / len(vms)
-        va = sum((vm_ect[vm] - avg_ect)**2 for vm in vm_ect) / len(vms)
-        utilization = sum(vm_ect.values()) / (makespan * len(vms))
-
-        return makespan, total_cost, va, utilization
-
-    def allocation_phase(self, tasks, vms, candidate_set, first_allocate):
-        vm_index = {vm.id: vm for vm in vms}
-        last = dict(first_allocate)
-
-        for _ in range(self.max_rounds):
-            vm_ect, _, avg_ect, _ = self._compute_vm_stats(tasks, vms, last)
-            threshold = avg_ect * self.load_threshold_factor
-
-            new_alloc = {}
-            record_load = {vm.id: 0 for vm in vms}
-
-            for t in tasks:
-                candidates = candidate_set[t.id]
-                if not candidates:
-                    vm_id = last[t.id]
-                    new_alloc[t.id] = vm_id
-                    record_load[vm_id] += self.ect(t, vm_index[vm_id])
-                    continue
-
-                vm_id = last[t.id]
-                current_load = self.ect(
-                    t, vm_index[vm_id]) + record_load[vm_id]
-
-                if current_load > threshold:
-                    best_vm = min(candidates, key=lambda vid: self.ect(
-                        t, vm_index[vid]) + record_load[vid])
-                    vm_id = best_vm
-
-                new_alloc[t.id] = vm_id
-                record_load[vm_id] += self.ect(t, vm_index[vm_id])
-
-            if new_alloc == last:
-                break
-            last = new_alloc
-
-        return last
-
-    def _compute_vm_stats(self, tasks, vms, allocation):
-        vm_index = {vm.id: vm for vm in vms}
-        vm_ect = {vm.id: 0 for vm in vms}
-        vm_ecc = {vm.id: 0 for vm in vms}
-
-        for t in tasks:
-            vm = vm_index[allocation[t.id]]
+            vm = vm_index[alloc[t.id]]
             ect = self.ect(t, vm)
             vm_ect[vm.id] += ect
             vm_ecc[vm.id] += ect * vm.cost_per_time
 
-        h = len(vms)
-        avg_ect = sum(vm_ect.values()) / h
-        va = sum((vm_ect[vid] - avg_ect)**2 for vid in vm_ect) / h
+        makespan = max(vm_ect.values())
+        cost = sum(vm_ecc.values())
 
-        return vm_ect, vm_ecc, avg_ect, va
+        avg = sum(vm_ect.values()) / len(vms)
+        va = sum((vm_ect[vid] - avg)**2 for vid in vm_ect) / len(vms)
+
+        util = sum(vm_ect.values()) / (makespan * len(vms))
+
+        return makespan, cost, va, util
+
+    def _compute_vm_stats(self, tasks, vms, alloc):
+        vm_index = {vm.id: vm for vm in vms}
+        vm_ect = {vm.id: 0 for vm in vms}
+
+        for t in tasks:
+            vm = vm_index[alloc[t.id]]
+            vm_ect[vm.id] += self.ect(t, vm)
+
+        avg = sum(vm_ect.values()) / len(vms)
+        va = sum((vm_ect[v] - avg)**2 for v in vm_ect) / len(vms)
+
+        vm_ecc = {vm.id: vm_ect[vm.id] * vm.cost_per_time for vm in vms}
+
+        return vm_ect, vm_ecc, avg, va
+
+    def allocation_phase(self, tasks, vms, cand, first):
+        last = dict(first)
+        vm_index = {vm.id: vm for vm in vms}
+
+        for _ in range(self.max_rounds):
+            vm_ect, _, avg, _ = self._compute_vm_stats(tasks, vms, last)
+            threshold = avg * self.load_threshold_factor
+
+            new = {}
+            record = {vm.id: 0 for vm in vms}
+
+            for t in tasks:
+                candidates = cand[t.id]
+                vm_id = last[t.id]
+
+                if not candidates:
+                    new[t.id] = vm_id
+                    record[vm_id] += self.ect(t, vm_index[vm_id])
+                    continue
+
+                current_load = self.ect(t, vm_index[vm_id]) + record[vm_id]
+
+                if current_load > threshold:
+                    vm_id = min(candidates, key=lambda vid: self.ect(
+                        t, vm_index[vid]) + record[vid])
+
+                new[t.id] = vm_id
+                record[vm_id] += self.ect(t, vm_index[vm_id])
+
+            if new == last:
+                break
+            last = new
+
+        return last
 
     def schedule(self, tasks, vms):
         cand, first = self.matching_phase(tasks, vms)
-        alloc = self.allocation_phase(tasks, vms, cand, first)
-        return alloc
+        return self.allocation_phase(tasks, vms, cand, first)
 
 
 # ============================================================
@@ -209,75 +206,67 @@ class AdaptiveMMAScheduler(MMAScheduler):
         self.gain_threshold = 0.001
         self.patience = 3
 
-    def allocation_phase(self, tasks, vms, candidate_set, first_allocate):
-        vm_index = {vm.id: vm for vm in vms}
-        task_index = {t.id: t for t in tasks}
-
-        last = dict(first_allocate)
-        no_improve = 0
+    def allocation_phase(self, tasks, vms, cand, first):
+        last = dict(first)
         best_va = float("inf")
+        fails = 0
 
-        for r in range(self.max_rounds):
+        vm_index = {vm.id: vm for vm in vms}
 
-            vm_ect, vm_ecc, avg_ect, va = self._compute_vm_stats(
-                tasks, vms, last)
-            threshold = avg_ect * self.load_threshold_factor
+        for _ in range(self.max_rounds):
+            vm_ect, vm_ecc, avg, va = self._compute_vm_stats(tasks, vms, last)
+            threshold = avg * self.load_threshold_factor
 
             new = {}
             record = {vm.id: 0 for vm in vms}
 
             for t in tasks:
-                candidates = candidate_set[t.id]
+                cands = cand[t.id]
 
-                if not candidates:
-                    vm_id = last[t.id]
-                    new[t.id] = vm_id
-                    record[vm_id] += self.ect(t, vm_index[vm_id])
+                if not cands:
+                    new[t.id] = last[t.id]
+                    record[last[t.id]] += self.ect(t, vm_index[last[t.id]])
                     continue
 
                 last_vm = last[t.id]
-                last_runtime = self.ect(t, vm_index[last_vm]) + record[last_vm]
-                overloaded = last_runtime > threshold
+                overloaded = (
+                    self.ect(t, vm_index[last_vm]) + record[last_vm]) > threshold
 
                 if overloaded:
-                    best_vm = min(candidates, key=lambda vid: self.ect(
+                    best = min(cands, key=lambda vid: self.ect(
                         t, vm_index[vid]) + record[vid])
                 else:
-                    best_vm = last_vm
+                    best = last_vm
                     best_gain = 0
 
-                    for vid in candidates:
+                    for vid in cands:
                         if vid == last_vm:
                             continue
+
                         old_vm = vm_index[last_vm]
                         new_vm = vm_index[vid]
 
-                        time_old = self.ect(t, old_vm)
-                        time_new = self.ect(t, new_vm)
-
-                        cost_old = self.ecc(t, old_vm)
-                        cost_new = self.ecc(t, new_vm)
-
-                        gain = (self.time_weight * (time_old - time_new) +
-                                self.cost_weight * (cost_old - cost_new))
-
+                        gain = (
+                            self.time_weight * (self.ect(t, old_vm) - self.ect(t, new_vm)) +
+                            self.cost_weight *
+                            (self.ecc(t, old_vm) - self.ecc(t, new_vm))
+                        )
                         if gain > self.gain_threshold and gain > best_gain:
                             best_gain = gain
-                            best_vm = vid
+                            best = vid
 
-                new[t.id] = best_vm
-                record[best_vm] += self.ect(t, vm_index[best_vm])
+                new[t.id] = best
+                record[best] += self.ect(t, vm_index[best])
 
-            vm_ect_new, vm_ecc_new, avg_ect_new, va_new = self._compute_vm_stats(
-                tasks, vms, new)
+            _, _, _, new_va = self._compute_vm_stats(tasks, vms, new)
 
-            if va_new < best_va:
-                best_va = va_new
-                no_improve = 0
+            if new_va < best_va:
+                best_va = new_va
+                fails = 0
             else:
-                no_improve += 1
+                fails += 1
 
-            if no_improve >= self.patience:
+            if fails >= self.patience:
                 break
 
             last = new
@@ -321,3 +310,86 @@ def build_example_environment(num_tasks=15, num_vms=5, rng=None):
         ))
 
     return tasks, vms
+
+
+# ============================================================
+# RUN EXPERIMENTS
+# ============================================================
+
+def run_experiments(num_trials=6, num_tasks=50, num_vms=10):
+    rows = []
+    seeds = [123, 456, 789, 101112, 202223, 303344]
+
+    for i in range(num_trials):
+        seed = seeds[i]
+        print(f"Running trial {i+1}/{num_trials} (seed={seed})")
+
+        tasks, vms = build_example_environment(
+            num_tasks=num_tasks,
+            num_vms=num_vms,
+            rng=random.Random(seed)
+        )
+
+        baseline = MMAScheduler(max_rounds=50, rng=np.random.default_rng(seed))
+        alloc_base = baseline.schedule(tasks, vms)
+        base_metrics = baseline.compute_stats(tasks, vms, alloc_base)
+
+        adaptive = AdaptiveMMAScheduler(
+            max_rounds=50, rng=np.random.default_rng(seed))
+        alloc_adapt = adaptive.schedule(tasks, vms)
+        adapt_metrics = adaptive.compute_stats(tasks, vms, alloc_adapt)
+
+        rows.append([
+            seed,
+            *base_metrics,
+            *adapt_metrics
+        ])
+
+    return rows
+
+
+# ============================================================
+# PLOT RESULTS
+# ============================================================
+
+def plot_results(rows, folder="mma_plots"):
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    rows = np.array(rows)
+    base_makespan = rows[:, 1]
+    adapt_makespan = rows[:, 5]
+
+    base_cost = rows[:, 2]
+    adapt_cost = rows[:, 6]
+
+    base_va = rows[:, 3]
+    adapt_va = rows[:, 7]
+
+    def paired_plot(base, adapt, ylabel, filename):
+        plt.figure(figsize=(7, 5))
+        for i in range(len(base)):
+            plt.plot([0, 1], [base[i], adapt[i]], marker="o")
+        plt.xticks([0, 1], ["Baseline", "Adaptive"])
+        plt.ylabel(ylabel)
+        plt.grid(True)
+        plt.title(f"{ylabel}: Baseline vs Adaptive")
+        plt.tight_layout()
+        plt.savefig(os.path.join(folder, filename))
+        plt.close()
+
+    paired_plot(base_makespan, adapt_makespan,
+                "Makespan", "makespan_paired.png")
+    paired_plot(base_cost, adapt_cost, "Cost", "cost_paired.png")
+    paired_plot(base_va, adapt_va, "Variance (VA)", "va_paired.png")
+
+    print(f"Plots saved in: {folder}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    rows = run_experiments(num_trials=6, num_tasks=50, num_vms=10)
+    plot_results(rows)

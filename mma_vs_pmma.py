@@ -1,7 +1,7 @@
 import random
 import time
 import multiprocessing as mp
-
+import matplotlib.pyplot as plt  # NEW: plotting
 
 #  Instance generation
 def generate_instance(num_tasks, num_vms):
@@ -123,9 +123,8 @@ def par_mma_allocation(assignment, tasks, vm_speeds, n_workers=4,
 
     return assignment
 
-
-#  Experiment runner
-def run_experiment(n_workers):
+#  Experiment runner (CHANGED: now collects results into 'store')
+def run_experiment(n_workers, store):
     random.seed(0)
     num_vms = 16
     task_sizes = [2000, 4000, 8000, 16000]
@@ -157,9 +156,83 @@ def run_experiment(n_workers):
 
         print(f"{n_tasks}, {seq_time:.4f}, {par_time:.4f}, {speedup:.2f}, {ms_seq:.2f}, {ms_par:.2f}")
 
+        # store results
+        store['tasks'].append(n_tasks)
+        store['seq_times'].append(seq_time)
+        store['par_times'][n_workers] = store['par_times'].get(n_workers, []) + [par_time]
+        store['speedups'][n_workers] = store['speedups'].get(n_workers, []) + [speedup]
+        store['makespans'].append(ms_seq)  # same for both
+
 if __name__ == "__main__":
     mp.freeze_support()  # important on Windows
 
-    # Try different worker counts
+    # container for results
+    results = {
+        'tasks': [],
+        'seq_times': [],
+        'par_times': {},   # keyed by n_workers
+        'speedups': {},    # keyed by n_workers
+        'makespans': []
+    }
+
+    # Run for different worker counts
     for workers in [4, 8]:
-        run_experiment(workers)
+        # reset the shared axes (tasks list should be the same order on both runs)
+        if not results['tasks']:  # only fill tasks once
+            run_experiment(workers, results)
+        else:
+            # preserve 'tasks' from first run; only add times/speedups for this workers
+            tmp_store = {'tasks': [], 'seq_times': [], 'par_times': {}, 'speedups': {}, 'makespans': []}
+            run_experiment(workers, tmp_store)
+            # merge only the per-workers lists from tmp_store
+            results['par_times'][workers] = tmp_store['par_times'][workers]
+            results['speedups'][workers]  = tmp_store['speedups'][workers]
+            # keep seq_times/makespans from the first run for consistency
+
+    
+    # Choose the 8-worker series for main comparison
+    tasks = results['tasks']
+    mma_time_8  = results['seq_times']                 # MMA times (same baseline)
+    pmma_time_8 = results['par_times'][8]              # P-MMA times with 8 workers
+    speedup_8   = results['speedups'][8]               # speedups with 8 workers
+    makespan    = results['makespans']                 # identical for MMA/P-MMA
+
+    # Scheduler runtime vs #tasks (8 workers) 
+    plt.figure()
+    plt.plot(tasks, mma_time_8, marker='o', label='MMA (sequential)')
+    plt.plot(tasks, pmma_time_8, marker='o', label='P-MMA (8 workers)')
+    plt.xlabel('Number of tasks'); plt.ylabel('Scheduler runtime (s)')
+    plt.title('Scheduler Runtime vs Tasks (16 VMs, 8 workers)')
+    plt.legend(); plt.grid(True); plt.tight_layout()
+    plt.savefig('runtime_vs_tasks_8workers.png', dpi=200)
+
+    # Speedup vs #tasks (8 workers)
+    plt.figure()
+    plt.bar([str(t) for t in tasks], [round(x, 2) for x in speedup_8])
+    plt.xlabel('Number of tasks'); plt.ylabel('Speedup (MMA time / P-MMA time)')
+    plt.title('Speedup vs Tasks (16 VMs, 8 workers)')
+    plt.tight_layout()
+    plt.savefig('speedup_vs_tasks_8workers.png', dpi=200)
+
+    # Makespan comparison (8k & 16k)
+    labels = ['8000', '16000']
+    # find indices for 8000 and 16000 in tasks
+    idx_8k = tasks.index(8000)
+    idx_16k = tasks.index(16000)
+    mma_ms  = [makespan[idx_8k], makespan[idx_16k]]
+    pmma_ms = [makespan[idx_8k], makespan[idx_16k]]  # identical
+    x = range(len(labels)); w = 0.35
+
+    plt.figure()
+    plt.bar([i - w/2 for i in x], mma_ms, width=w, label='MMA')
+    plt.bar([i + w/2 for i in x], pmma_ms, width=w, label='P-MMA')
+    plt.xlabel('Number of tasks'); plt.ylabel('Makespan (time units)')
+    plt.title('Makespan Comparison (16 VMs)')
+    plt.xticks(list(x), labels); plt.legend(); plt.tight_layout()
+    plt.savefig('makespan_comparison.png', dpi=200)
+
+    
+    print("\nSaved figures:")
+    print(" - runtime_vs_tasks_8workers.png")
+    print(" - speedup_vs_tasks_8workers.png")
+    print(" - makespan_comparison.png")
